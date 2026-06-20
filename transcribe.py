@@ -28,7 +28,7 @@ import json
 import urllib.request
 import gc
 import re
-from difflib import SequenceMatcher  # <--- NUEVO: Para el Escudo de Similitud
+from difflib import SequenceMatcher
 from faster_whisper import WhisperModel
 
 def format_timestamp(seconds: float):
@@ -52,22 +52,23 @@ def capitalizar_primera_letra(texto):
             return texto[:i] + char.upper() + texto[i+1:]
     return texto
 
-# --- CONEXIÓN A OLLAMA (CON ESCUDO DE SIMILITUD DE PYTHON) ---
+# --- CONEXIÓN A OLLAMA (CON ESCUDO ANTI-DUPLICADOS) ---
 def corregir_lote_con_llama(lote_dicts, guion_referencia):
     url = "http://127.0.0.1:11434/api/generate"
     
     lineas_entrada = [f"{sub['index']}|{sub['text']}" for sub in lote_dicts]
     texto_entrada = "\n".join(lineas_entrada)
     
-    prompt = f"""Eres un corrector ortográfico. Tu única tarea es corregir REGIONALISMOS basándote en el GUION.
+    prompt = f"""Eres un corrector ortográfico de subtítulos. Vas a comparar la ENTRADA (lo que escuchó la IA) con el GUION original.
 
-REGLA DE ORO: EL AUDIO MANDA.
-1. Si el audio dice "querés", "tenés" o "sos", cámbialo a "querías", "tienes", "eres" (según el guion original).
-2. PROHIBIDO corregir gramática si están en español válido. (Ejemplo: si el audio dice "que esperar", NO lo cambies a "que esperas", déjalo intacto).
-3. NUNCA mezcles líneas ni te saltes subtítulos. Devuelve la lista exacta con los mismos IDs de entrada.
+REGLAS DE CORRECCIÓN (¡Síguelas estrictamente!):
+1. ERRORES DE ESCUCHA: Si la ENTRADA dice algo erróneo (ej. "conseguir") pero el GUION dice la palabra correcta (ej. "construir"), OBLIGATORIAMENTE cámbialo por la palabra del guion.
+2. REGIONALISMOS (VOSEO): Si la ENTRADA dice "querés", "tenés", OBLIGATORIAMENTE cámbialo a "querías", "tienes" según el guion.
+3. CERO SINÓNIMOS: Si la entrada está bien, NO cambies palabras por sinónimos (ej. NUNCA cambies "estaba" por "había"). Respeta la palabra original.
+4. IMPROVISACIONES: Si la entrada tiene palabras que no están en el guion, déjalas INTACTAS. El orador improvisó.
+5. NO DUPLIQUES: Jamás repitas la oración de arriba.
 
-FORMATO ESTRICTO:
-Devuelve exactamente la misma lista, línea por línea, usando el formato "ID|texto". PROHIBIDO dar explicaciones.
+Devuelve la lista con el formato exacto "ID|texto". Cero plática.
 
 GUION ORIGINAL:
 {guion_referencia}
@@ -75,7 +76,7 @@ GUION ORIGINAL:
 ENTRADA A CORREGIR:
 {texto_entrada}
 
-SALIDA (Formato ID|texto):
+SALIDA:
 """
 
     payload = {
@@ -111,28 +112,40 @@ SALIDA (Formato ID|texto):
                         
                         dict_respuestas[idx] = txt
             
-            # --- EL ESCUDO ESTRICTO DE SIMILITUD (NIVEL DIOS) ---
+            # --- EL ESCUDO ESTRICTO DE PYTHON ---
+            textos_nuevos_aceptados = set()
+            
             for sub in lote_dicts:
+                texto_viejo = sub['text']
+                
                 if sub['index'] in dict_respuestas:
-                    texto_viejo = sub['text']
                     texto_nuevo = dict_respuestas[sub['index']]
                     
                     if texto_viejo.lower() != texto_nuevo.lower():
                         pal_viejas = len(texto_viejo.split())
                         pal_nuevas = len(texto_nuevo.split())
                         
-                        # 1. Escudo de Longitud (Evita que borre oraciones enteras)
-                        if pal_nuevas > 0 and abs(pal_nuevas - pal_viejas) <= 2:
-                            # 2. Escudo de Similitud (Evita el "Deslizamiento de Contexto")
-                            # Compara letra por letra. Si cambió más del 25% de la oración, Llama alucinó y se equivocó de línea.
+                        if pal_nuevas > 0 and abs(pal_nuevas - pal_viejas) <= 3:
                             similitud = SequenceMatcher(None, texto_viejo.lower(), texto_nuevo.lower()).ratio()
                             
-                            if similitud >= 0.75:
+                            # MAGIA: Escudo Anti-Duplicados
+                            # Si Llama intenta usar un texto que YA usamos, y no era así originalmente, lo bloqueamos
+                            if texto_nuevo.lower() in textos_nuevos_aceptados and texto_viejo.lower() not in textos_nuevos_aceptados:
+                                print(f"[*] Escudo Anti-Duplicados en ID {sub['index']}: Llama repitió una línea. Se mantuvo original.")
+                                textos_nuevos_aceptados.add(texto_viejo.lower())
+                            elif similitud >= 0.55: # Permite corregir "conseguir" por "construir"
                                 sub['text'] = texto_nuevo
+                                textos_nuevos_aceptados.add(texto_nuevo.lower())
                             else:
-                                print(f"[*] Escudo activado en ID {sub['index']}: Llama confundió la línea (Similitud {similitud:.2f}). Se mantuvo original.")
+                                print(f"[*] Escudo de Similitud en ID {sub['index']}: (Ratio {similitud:.2f}) Llama alucinó. Se mantuvo original.")
+                                textos_nuevos_aceptados.add(texto_viejo.lower())
                         else:
-                            print(f"[*] Escudo activado en ID {sub['index']}: Llama borró/agregó mucho texto. Se mantuvo original.")
+                            print(f"[*] Escudo de Longitud en ID {sub['index']}: Llama alteró demasiadas palabras. Se mantuvo original.")
+                            textos_nuevos_aceptados.add(texto_viejo.lower())
+                    else:
+                        textos_nuevos_aceptados.add(texto_viejo.lower())
+                else:
+                    textos_nuevos_aceptados.add(texto_viejo.lower())
                     
     except Exception as e:
         print(f"[ERROR OLLAMA]: {str(e)}")
@@ -359,7 +372,7 @@ class TranscriptorProApp(ctk.CTk):
 
             self.after(0, self.actualizar_metricas, info.language, info.duration)
 
-            MAX_PALABRAS = 14
+            MAX_PALABRAS = 12 
             MIN_PALABRAS = 1
             sub_index = 1
             lista_srt_crudo = []
@@ -431,8 +444,8 @@ class TranscriptorProApp(ctk.CTk):
             usar_llama = (motor == "Llama 3 Local" and len(guion) > 10)
             
             if usar_llama:
-                self.log_system("🧠 Iniciando Llama 3 (Con Escudo de Similitud). Corrigiendo subtítulos...", "llama_msg")
-                tamano_lote = 15
+                self.log_system("🧠 Iniciando Llama 3. Corrigiendo subtítulos por lotes...", "llama_msg")
+                tamano_lote = 8 # Lotes chiquitos para que no se maree Llama
                 total_lotes = math.ceil(len(lista_srt_crudo) / tamano_lote)
                 
                 for i in range(0, len(lista_srt_crudo), tamano_lote):
