@@ -28,9 +28,9 @@ import json
 import urllib.request
 import gc
 import re
+from difflib import SequenceMatcher  # <--- NUEVO: Para el Escudo de Similitud
 from faster_whisper import WhisperModel
 
-# --- Funciones de Formato ---
 def format_timestamp(seconds: float):
     hours = math.floor(seconds / 3600)
     seconds %= 3600
@@ -45,26 +45,37 @@ def format_ui_time(seconds: float):
     secs = math.floor(seconds % 60)
     return f"{minutes}:{secs:02d}"
 
-# --- CONEXIÓN A OLLAMA (Con Filtro Destructor de Notas) ---
-def corregir_bloque_srt_con_llama(bloque_srt, guion_referencia):
+def capitalizar_primera_letra(texto):
+    texto = texto.strip()
+    for i, char in enumerate(texto):
+        if char.isalpha(): 
+            return texto[:i] + char.upper() + texto[i+1:]
+    return texto
+
+# --- CONEXIÓN A OLLAMA (CON ESCUDO DE SIMILITUD DE PYTHON) ---
+def corregir_lote_con_llama(lote_dicts, guion_referencia):
     url = "http://127.0.0.1:11434/api/generate"
     
-    # JERARQUÍA INVERTIDA: El audio tiene prioridad absoluta
-    prompt = f"""Eres un editor ortográfico estricto de subtítulos.
+    lineas_entrada = [f"{sub['index']}|{sub['text']}" for sub in lote_dicts]
+    texto_entrada = "\n".join(lineas_entrada)
+    
+    prompt = f"""Eres un corrector ortográfico. Tu única tarea es corregir REGIONALISMOS basándote en el GUION.
 
-JERARQUÍA DE REGLAS (Síguelas en este orden exacto):
-1. IMPROVISACIONES (LA LEY DEL AUDIO): El audio manda. Si el SRT tiene palabras o frases que no están en el guion, es porque el orador improvisó. DEBES MANTENER la improvisación del SRT intacta. No fuerces el guion.
-2. CONJUGACIONES Y DIALECTO: SOLO si hay un claro error de regionalismo (ej. el SRT dice "querés", "tenés" pero el guion dice "querías", "tienes"), reemplázalo usando la palabra del guion.
-3. PROHIBICIONES ESTRICTAS (FORMATO): 
-   - Devuelve ÚNICAMENTE el código SRT puro.
-   - PROHIBIDO justificar tus cambios. NO uses flechas ("->", "→"). NO escribas la palabra "correcto", ni "reemplazo", ni "no hay error".
-   - Prohibido repetir palabras entre el final de un subtítulo y el inicio de otro.
+REGLA DE ORO: EL AUDIO MANDA.
+1. Si el audio dice "querés", "tenés" o "sos", cámbialo a "querías", "tienes", "eres" (según el guion original).
+2. PROHIBIDO corregir gramática si están en español válido. (Ejemplo: si el audio dice "que esperar", NO lo cambies a "que esperas", déjalo intacto).
+3. NUNCA mezcles líneas ni te saltes subtítulos. Devuelve la lista exacta con los mismos IDs de entrada.
 
-GUION ORIGINAL DE REFERENCIA:
+FORMATO ESTRICTO:
+Devuelve exactamente la misma lista, línea por línea, usando el formato "ID|texto". PROHIBIDO dar explicaciones.
+
+GUION ORIGINAL:
 {guion_referencia}
 
-FRAGMENTO SRT A CORREGIR:
-{bloque_srt}
+ENTRADA A CORREGIR:
+{texto_entrada}
+
+SALIDA (Formato ID|texto):
 """
 
     payload = {
@@ -72,7 +83,7 @@ FRAGMENTO SRT A CORREGIR:
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.0 # 0 creatividad, 100% obediencia
+            "temperature": 0.0 
         }
     }
     
@@ -83,46 +94,51 @@ FRAGMENTO SRT A CORREGIR:
             result = json.loads(response.read().decode("utf-8"))
             texto_corregido = result.get("response", "").strip()
             
-            # --- EL NUEVO ESCUDO DESTRUCTIVO DE PYTHON ---
-            # Escanea el texto y busca bloques válidos (ID + Tiempo + Texto)
-            pattern = r'(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\s*\n|\Z)'
-            matches = re.findall(pattern, texto_corregido, re.DOTALL)
+            # --- EL EXTRACTOR DESTRUCTIVO DE PYTHON ---
+            dict_respuestas = {}
+            for linea in texto_corregido.split('\n'):
+                partes = linea.split('|', 1)
+                if len(partes) == 2:
+                    idx_str = re.sub(r'\D', '', partes[0])
+                    if idx_str:
+                        idx = int(idx_str)
+                        txt = partes[1].strip()
+                        
+                        txt = txt.split('->')[0].strip()
+                        txt = re.sub(r'\(.*\)', '', txt).strip() 
+                        txt = re.sub(r'(?i)no hay error.*$', '', txt).strip()
+                        txt = re.sub(r'(?i)se mantiene igual.*$', '', txt).strip()
+                        
+                        dict_respuestas[idx] = txt
             
-            if not matches:
-                return bloque_srt # Si Llama alucinó un párrafo completo, ignoramos y devolvemos original
-                
-            bloques_limpios = []
-            
-            for match in matches:
-                idx = match[0].strip()
-                timestamp = match[1].strip()
-                texto_crudo = match[2].strip()
-                
-                # Tomamos solo la primera línea del texto (por si Llama metió notas abajo del subtítulo)
-                texto = texto_crudo.split('\n')[0].lower()
-                
-                # --- LA GUILLOTINA ---
-                # Corta todo lo que esté después de una flecha o palabras prohibidas
-                texto = texto.split('->')[0].split('→')[0].strip()
-                texto = re.sub(r'(?i)\bcorrecto\b.*$', '', texto).strip()
-                texto = re.sub(r'(?i)\bno hay error\b.*$', '', texto).strip()
-                texto = re.sub(r'(?i)\breemplazo\b.*$', '', texto).strip()
-                texto = re.sub(r'(?i)\bsegún la ley\b.*$', '', texto).strip()
-                
-                # Limpieza de signos y arrobas
-                texto = texto.replace("@", "o") 
-                for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
-                    texto = texto.replace(char, "")
-                
-                bloques_limpios.append(f"{idx}\n{timestamp}\n{texto.strip()}")
-            
-            return '\n\n'.join(bloques_limpios)
-            
+            # --- EL ESCUDO ESTRICTO DE SIMILITUD (NIVEL DIOS) ---
+            for sub in lote_dicts:
+                if sub['index'] in dict_respuestas:
+                    texto_viejo = sub['text']
+                    texto_nuevo = dict_respuestas[sub['index']]
+                    
+                    if texto_viejo.lower() != texto_nuevo.lower():
+                        pal_viejas = len(texto_viejo.split())
+                        pal_nuevas = len(texto_nuevo.split())
+                        
+                        # 1. Escudo de Longitud (Evita que borre oraciones enteras)
+                        if pal_nuevas > 0 and abs(pal_nuevas - pal_viejas) <= 2:
+                            # 2. Escudo de Similitud (Evita el "Deslizamiento de Contexto")
+                            # Compara letra por letra. Si cambió más del 25% de la oración, Llama alucinó y se equivocó de línea.
+                            similitud = SequenceMatcher(None, texto_viejo.lower(), texto_nuevo.lower()).ratio()
+                            
+                            if similitud >= 0.75:
+                                sub['text'] = texto_nuevo
+                            else:
+                                print(f"[*] Escudo activado en ID {sub['index']}: Llama confundió la línea (Similitud {similitud:.2f}). Se mantuvo original.")
+                        else:
+                            print(f"[*] Escudo activado en ID {sub['index']}: Llama borró/agregó mucho texto. Se mantuvo original.")
+                    
     except Exception as e:
         print(f"[ERROR OLLAMA]: {str(e)}")
-        return bloque_srt
+        
+    return lote_dicts
 
-# --- CONFIGURACIÓN GLOBAL ---
 ctk.set_appearance_mode("dark")
 
 class TranscriptorProApp(ctk.CTk):
@@ -137,8 +153,7 @@ class TranscriptorProApp(ctk.CTk):
         self.modelo_cargado = None
         self.total_segmentos = 0
         self.ultimo_srt_generado = None
-        
-        self.altura_guion_actual = 120 
+        self.altura_guion_actual = 120  
 
         self.crear_interfaz()
         self.verificar_estado_ollama()
@@ -148,7 +163,6 @@ class TranscriptorProApp(ctk.CTk):
         header_frame.pack(fill="x", padx=20, pady=(20, 10))
         
         ctk.CTkLabel(header_frame, text="← Transcripción", font=("Helvetica", 18, "bold"), text_color="#FFFFFF").pack(side="left")
-        
         self.btn_editar = ctk.CTkButton(header_frame, text="Editar SRT", width=100, fg_color="transparent", border_width=1, border_color="#333333", text_color="#A0A0A0", hover_color="#1A1A1A", command=self.editar_srt)
         self.btn_editar.pack(side="right")
 
@@ -170,10 +184,8 @@ class TranscriptorProApp(ctk.CTk):
         font_meta = ("Helvetica", 11, "bold")
         self.lbl_idioma = ctk.CTkLabel(meta_frame, text="IDIOMA --", font=font_meta, text_color="#555555")
         self.lbl_idioma.pack(side="left", padx=(0, 20))
-        
         self.lbl_duracion = ctk.CTkLabel(meta_frame, text="DURACIÓN --", font=font_meta, text_color="#555555")
         self.lbl_duracion.pack(side="left", padx=20)
-        
         self.lbl_segmentos = ctk.CTkLabel(meta_frame, text="SEGMENTOS 0", font=font_meta, text_color="#555555")
         self.lbl_segmentos.pack(side="left", padx=20)
 
@@ -184,7 +196,6 @@ class TranscriptorProApp(ctk.CTk):
         script_header.pack(fill="x", padx=15, pady=(10, 0))
         
         ctk.CTkLabel(script_header, text="Guion original", font=("Helvetica", 13, "bold"), text_color="#8E7BB3").pack(side="left")
-        
         self.btn_generar = ctk.CTkButton(script_header, text="Generar SRT", width=120, fg_color="#36225B", hover_color="#4B2F7E", text_color="#E0D4F5", command=self.iniciar_transcripcion)
         self.btn_generar.pack(side="right")
         
@@ -202,7 +213,6 @@ class TranscriptorProApp(ctk.CTk):
 
         self.resizer_frame = ctk.CTkFrame(script_frame, height=10, fg_color="#36225B", cursor="sb_v_double_arrow", corner_radius=3)
         self.resizer_frame.pack(fill="x", padx=15, pady=(2, 10))
-        
         lbl_dots = ctk.CTkLabel(self.resizer_frame, text="•••", font=("Arial", 9, "bold"), text_color="#A0A0A0", height=10)
         lbl_dots.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -232,10 +242,8 @@ class TranscriptorProApp(ctk.CTk):
     def redimensionar_guion(self, event):
         delta = event.y_root - self._start_y
         self.altura_guion_actual += delta
-        
         if self.altura_guion_actual < 60: self.altura_guion_actual = 60
         if self.altura_guion_actual > 450: self.altura_guion_actual = 450
-            
         self.txt_guion.configure(height=self.altura_guion_actual)
         self._start_y = event.y_root
 
@@ -260,10 +268,8 @@ class TranscriptorProApp(ctk.CTk):
     def editar_srt(self):
         if self.ultimo_srt_generado and os.path.exists(self.ultimo_srt_generado):
             try:
-                if os.name == 'nt': 
-                    os.startfile(self.ultimo_srt_generado)
-                elif sys.platform == "darwin": 
-                    subprocess.call(('open', self.ultimo_srt_generado))
+                if os.name == 'nt': os.startfile(self.ultimo_srt_generado)
+                elif sys.platform == "darwin": subprocess.call(('open', self.ultimo_srt_generado))
             except Exception as e:
                 self.log_system(f"⚠️ Error al abrir el archivo: {str(e)}")
 
@@ -273,13 +279,11 @@ class TranscriptorProApp(ctk.CTk):
             self.archivo_entrada = filepath
             nombre_corto = filepath.split("/")[-1]
             self.lbl_archivo.configure(text=nombre_corto, text_color="#EEEEEE")
-            
             self.lbl_idioma.configure(text="IDIOMA --", text_color="#555555")
             self.lbl_duracion.configure(text="DURACIÓN --", text_color="#555555")
             self.lbl_segmentos.configure(text="SEGMENTOS 0", text_color="#555555")
             self.total_segmentos = 0
             self.lbl_titulo_timeline.configure(text="Línea de tiempo")
-            
             self.txt_timeline.configure(state="normal")
             self.txt_timeline.delete("1.0", "end")
             self.txt_timeline.configure(state="disabled")
@@ -319,42 +323,33 @@ class TranscriptorProApp(ctk.CTk):
         try:
             req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req)
-        except Exception:
-            pass
+        except Exception: pass
 
     def iniciar_transcripcion(self):
         if not self.archivo_entrada:
             self.log_system("⚠️ ERROR: Selecciona un archivo multimedia primero.")
             return
-            
         archivo_salida = filedialog.asksaveasfilename(defaultextension=".srt", initialfile="subtitulos.srt")
-        if not archivo_salida:
-            return 
-            
+        if not archivo_salida: return 
         self.ultimo_srt_generado = archivo_salida 
-            
         self.txt_timeline.configure(state="normal")
         self.txt_timeline.delete("1.0", "end")
         self.txt_timeline.configure(state="disabled")
-        
         self.btn_generar.configure(state="disabled", text="Procesando...")
         self.lbl_titulo_timeline.configure(text="Línea de tiempo (Transcribiendo...)")
         self.total_segmentos = 0
-
         motor_seleccionado = self.combo_motor.get()
         guion_texto = self.txt_guion.get("1.0", "end").strip()
-
         hilo = threading.Thread(target=self.procesar_whisper_y_llama, args=(self.archivo_entrada, archivo_salida, motor_seleccionado, guion_texto))
         hilo.start()
 
     def procesar_whisper_y_llama(self, entrada, salida, motor, guion):
         try:
-            # FASE 1: WHISPER
             if not self.modelo_cargado:
                 self.log_system("Iniciando motor Whisper V3 (GPU). Por favor espera...")
                 self.modelo_cargado = WhisperModel("large-v3", device="cuda", compute_type="float16")
             
-            self.log_system("Analizando audio y generando línea de tiempo base...")
+            self.log_system("Analizando audio y calculando pausas...")
             
             segments, info = self.modelo_cargado.transcribe(
                 entrada, beam_size=5, language="es",
@@ -365,31 +360,49 @@ class TranscriptorProApp(ctk.CTk):
             self.after(0, self.actualizar_metricas, info.language, info.duration)
 
             MAX_PALABRAS = 14
-            MIN_PALABRAS = 5
+            MIN_PALABRAS = 1
             sub_index = 1
             lista_srt_crudo = []
             
             for segment in segments:
+                words = segment.words
                 current_chunk_words = []
                 chunk_start = None
                 
-                for word_obj in segment.words:
+                for idx, word_obj in enumerate(words):
                     if chunk_start is None:
                         chunk_start = word_obj.start
                     
-                    palabra_actual = word_obj.word.strip()
-                    current_chunk_words.append(palabra_actual)
+                    palabra_cruda = word_obj.word.strip()
+                    tiene_puntos = "..." in palabra_cruda or "…" in palabra_cruda
+                    duracion = word_obj.end - word_obj.start
                     
-                    pausa_fuerte = any(p in palabra_actual for p in ['.', '?', '!', '…'])
-                    pausa_suave = any(p in palabra_actual for p in [',', ':', ';'])
+                    gap = 0.0
+                    if idx + 1 < len(words):
+                        gap = words[idx+1].start - word_obj.end
+                    pausa_por_silencio = gap >= 0.45
                     
-                    if (len(current_chunk_words) >= MAX_PALABRAS) or pausa_fuerte or (pausa_suave and len(current_chunk_words) >= MIN_PALABRAS):
+                    palabra_limpia = palabra_cruda.lower()
+                    for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
+                        palabra_limpia = palabra_limpia.replace(char, "")
+                    
+                    es_suspenso = tiene_puntos or (duracion > 1.2 and len(palabra_limpia) > 3)
+                    
+                    if es_suspenso:
+                        palabra_limpia += "..."
+                    
+                    if "¿" in palabra_cruda: palabra_limpia = "¿" + palabra_limpia
+                    if "?" in palabra_cruda: palabra_limpia = palabra_limpia + "?"
+                    
+                    current_chunk_words.append(palabra_limpia)
+                    
+                    pausa_fuerte = any(p in palabra_cruda for p in ['.', '?', '!', '…'])
+                    pausa_suave = any(p in palabra_cruda for p in [',', ':', ';'])
+                    
+                    if (len(current_chunk_words) >= MAX_PALABRAS) or pausa_fuerte or (pausa_suave and len(current_chunk_words) >= MIN_PALABRAS) or es_suspenso or pausa_por_silencio:
                         chunk_end = word_obj.end
                         texto_final = " ".join(current_chunk_words)
-                        
-                        for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
-                            texto_final = texto_final.replace(char, "")
-                        texto_final = texto_final.lower()
+                        texto_final = re.sub(r'\.{4,}', '...', texto_final)
                         
                         lista_srt_crudo.append({"index": sub_index, "start": format_timestamp(chunk_start), "end": format_timestamp(chunk_end), "text": texto_final})
                         
@@ -403,58 +416,75 @@ class TranscriptorProApp(ctk.CTk):
                 if current_chunk_words:
                     chunk_end = segment.end
                     texto_final = " ".join(current_chunk_words)
-                    for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
-                        texto_final = texto_final.replace(char, "")
-                    texto_final = texto_final.lower()
+                    texto_final = re.sub(r'\.{4,}', '...', texto_final)
                         
                     lista_srt_crudo.append({"index": sub_index, "start": format_timestamp(chunk_start), "end": format_timestamp(chunk_end), "text": texto_final})
                     self.log_segment(chunk_start, chunk_end, texto_final)
                     self.after(0, self.actualizar_contador_segmentos)
                     sub_index += 1
 
-            srt_final_text = ""
-            for sub in lista_srt_crudo:
-                srt_final_text += f"{sub['index']}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n"
-            
-            with open(salida, "w", encoding="utf-8") as f:
-                f.write(srt_final_text)
-
-            # FASE 2: LIBERAR GPU DE WHISPER
             self.log_system("\nLiberando memoria gráfica de Whisper...", "sys_msg")
             del self.modelo_cargado
             self.modelo_cargado = None
             gc.collect() 
                 
-            # FASE 3: CORRECCIÓN EN LOTES (LLAMA)
             usar_llama = (motor == "Llama 3 Local" and len(guion) > 10)
             
             if usar_llama:
-                self.log_system("🧠 Iniciando Llama 3. Corrigiendo subtítulos por lotes...", "llama_msg")
-                
+                self.log_system("🧠 Iniciando Llama 3 (Con Escudo de Similitud). Corrigiendo subtítulos...", "llama_msg")
                 tamano_lote = 15
                 total_lotes = math.ceil(len(lista_srt_crudo) / tamano_lote)
-                texto_srt_corregido = ""
                 
                 for i in range(0, len(lista_srt_crudo), tamano_lote):
                     lote_actual = lista_srt_crudo[i : i + tamano_lote]
-                    bloque_str = ""
-                    for sub in lote_actual:
-                        bloque_str += f"{sub['index']}\n{sub['start']} --> {sub['end']}\n{sub['text']}\n\n"
-                    
                     numero_lote = int(i / tamano_lote) + 1
                     self.log_system(f"  -> Procesando lote {numero_lote} de {total_lotes}...", "llama_msg")
                     
-                    bloque_corregido = corregir_bloque_srt_con_llama(bloque_str, guion)
-                    texto_srt_corregido += bloque_corregido + "\n\n"
+                    corregir_lote_con_llama(lote_actual, guion)
                 
-                with open(salida, "w", encoding="utf-8") as f:
-                    f.write(texto_srt_corregido.strip() + "\n")
-                    
-                self.log_system("✨ Llama 3 ha finalizado la corrección del archivo SRT.", "llama_msg")
+                self.log_system("✨ Llama 3 ha finalizado la corrección.", "llama_msg")
                 self._forzar_limpieza_vram_ollama()
                 
             elif motor == "Llama 3 Local":
                 self.log_system("⚠️ Elegiste Llama 3 pero no pegaste el guion. El archivo SRT se guardó en crudo.", "sys_msg")
+
+            # --- ESTÉTICA FINAL DE ESCRITURA ---
+            srt_final_text = ""
+            capitalizar_sig = True
+            
+            for sub in lista_srt_crudo:
+                texto_limpio = sub['text'].strip()
+                texto_limpio = texto_limpio.replace("@", "o")
+                
+                texto_limpio = texto_limpio.replace("...", "___ELLIPSIS___").replace("…", "___ELLIPSIS___")
+                texto_limpio = texto_limpio.replace("¿", "___QOPEN___").replace("?", "___QCLOSE___")
+                
+                for char in [',', '.', ';', ':', '!', '¡', '"', "'", '(', ')']:
+                    texto_limpio = texto_limpio.replace(char, "")
+                    
+                texto_limpio = texto_limpio.replace("___ELLIPSIS___", "...")
+                texto_limpio = texto_limpio.replace("___QOPEN___", "¿").replace("___QCLOSE___", "?")
+                
+                texto_limpio = texto_limpio.lower()
+                
+                if sub['index'] == 1:
+                    texto_limpio = capitalizar_primera_letra(texto_limpio)
+                elif "¿" in texto_limpio:
+                    for i, char in enumerate(texto_limpio):
+                        if char.isalpha():
+                            texto_limpio = texto_limpio[:i] + char.upper() + texto_limpio[i+1:]
+                            break
+                elif capitalizar_sig and len(texto_limpio) > 0:
+                    texto_limpio = capitalizar_primera_letra(texto_limpio)
+                    capitalizar_sig = False
+                    
+                if texto_limpio.endswith("..."):
+                    capitalizar_sig = True
+                
+                srt_final_text += f"{sub['index']}\n{sub['start']} --> {sub['end']}\n{texto_limpio}\n\n"
+            
+            with open(salida, "w", encoding="utf-8") as f:
+                f.write(srt_final_text.strip() + "\n")
 
             self.log_system(f"✅ ¡PROCESO COMPLETADO EXITOSAMENTE!")
             
