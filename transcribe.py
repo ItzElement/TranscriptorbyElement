@@ -139,6 +139,9 @@ class TranscriptorProApp(ctk.CTk):
         self.modelo_cargado = None
         self.total_segmentos = 0
         self.ultimo_srt_generado = None
+        
+        # --- NUEVO: Variable para controlar la altura de la caja del guion ---
+        self.altura_guion_actual = 120 
 
         self.crear_interfaz()
         self.verificar_estado_ollama()
@@ -197,8 +200,23 @@ class TranscriptorProApp(ctk.CTk):
         
         ctk.CTkLabel(script_header, text="MOTOR", font=("Helvetica", 10, "bold"), text_color="#555555").pack(side="right", padx=5)
 
-        self.txt_guion = ctk.CTkTextbox(script_frame, height=120, fg_color="#151515", border_width=0, text_color="#B0B0B0", font=("Helvetica", 13))
-        self.txt_guion.pack(fill="x", padx=15, pady=15)
+        # --- SE APLICA LA ALTURA VARIABLE AQUÍ ---
+        self.txt_guion = ctk.CTkTextbox(script_frame, height=self.altura_guion_actual, fg_color="#151515", border_width=0, text_color="#B0B0B0", font=("Helvetica", 13))
+        self.txt_guion.pack(fill="x", padx=15, pady=(15, 0))
+
+        # --- LA NUEVA PESTAÑITA (RESIZER) ---
+        self.resizer_frame = ctk.CTkFrame(script_frame, height=10, fg_color="#36225B", cursor="sb_v_double_arrow", corner_radius=3)
+        self.resizer_frame.pack(fill="x", padx=15, pady=(2, 10))
+        
+        lbl_dots = ctk.CTkLabel(self.resizer_frame, text="•••", font=("Arial", 9, "bold"), text_color="#A0A0A0", height=10)
+        lbl_dots.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Eventos para arrastrar y cambiar tamaño
+        self.resizer_frame.bind("<ButtonPress-1>", self.iniciar_redimension)
+        self.resizer_frame.bind("<B1-Motion>", self.redimensionar_guion)
+        lbl_dots.bind("<ButtonPress-1>", self.iniciar_redimension)
+        lbl_dots.bind("<B1-Motion>", self.redimensionar_guion)
+        # ------------------------------------
 
         self.lbl_titulo_timeline = ctk.CTkLabel(self, text="Línea de tiempo", font=("Helvetica", 12, "bold"), text_color="#777777")
         self.lbl_titulo_timeline.pack(anchor="w", padx=20, pady=(10, 0))
@@ -214,6 +232,21 @@ class TranscriptorProApp(ctk.CTk):
         self.txt_timeline._textbox.tag_config("sys_msg", foreground="#F39C12", font=("Helvetica", 12, "italic")) 
         self.txt_timeline._textbox.tag_config("llama_msg", foreground="#9B59B6", font=("Helvetica", 12, "italic")) 
         self.txt_timeline.configure(state="disabled")
+
+    # --- LÓGICA DE LA PESTAÑITA REDIMENSIONABLE ---
+    def iniciar_redimension(self, event):
+        self._start_y = event.y_root
+
+    def redimensionar_guion(self, event):
+        delta = event.y_root - self._start_y
+        self.altura_guion_actual += delta
+        
+        if self.altura_guion_actual < 60: self.altura_guion_actual = 60
+        if self.altura_guion_actual > 450: self.altura_guion_actual = 450
+            
+        self.txt_guion.configure(height=self.altura_guion_actual)
+        self._start_y = event.y_root
+    # ----------------------------------------------
 
     def verificar_estado_ollama(self):
         threading.Thread(target=self._hilo_ping_ollama, daemon=True).start()
@@ -422,9 +455,6 @@ class TranscriptorProApp(ctk.CTk):
                     
                     bloque_corregido = corregir_bloque_srt_con_llama(bloque_str, guion)
                     texto_srt_corregido += bloque_corregido + "\n\n"
-                
-                # LIMPIEZA DE ESPACIOS DOBLES EN BLANCO
-                texto_srt_corregido = re.sub(r'\n{3,}', '\n\n', texto_srt_corregido)
                 
                 with open(salida, "w", encoding="utf-8") as f:
                     f.write(texto_srt_corregido.strip() + "\n")
