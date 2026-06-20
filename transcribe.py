@@ -45,20 +45,20 @@ def format_ui_time(seconds: float):
     secs = math.floor(seconds % 60)
     return f"{minutes}:{secs:02d}"
 
-# --- CONEXIÓN A OLLAMA (Cerebro Definitivo) ---
+# --- CONEXIÓN A OLLAMA (Con Filtro Destructor de Notas) ---
 def corregir_bloque_srt_con_llama(bloque_srt, guion_referencia):
     url = "http://127.0.0.1:11434/api/generate"
     
-    # JERARQUÍA DE REGLAS PARA EVITAR CONFLICTOS LÓGICOS
+    # JERARQUÍA INVERTIDA: El audio tiene prioridad absoluta
     prompt = f"""Eres un editor ortográfico estricto de subtítulos.
 
 JERARQUÍA DE REGLAS (Síguelas en este orden exacto):
-1. CONJUGACIONES Y DIALECTO (LA LEY DEL GUION): Compara las palabras del SRT con las del guion. Si el SRT tiene una variación regional, error de dictado o conjugación distinta (ejemplo: dice "querés", "quieres", "hablastes"), pero el guion dice "querías" o "hablaste", OBLIGATORIAMENTE debes reemplazar la palabra del SRT por la palabra exacta del guion original.
-2. IMPROVISACIONES (LA LEY DEL AUDIO): Solo si el SRT contiene palabras EXTRA o frases completamente distintas que NO están en el guion, asume que es una improvisación y MANTÉNLAS. 
-3. PROHIBICIONES ESTRICTAS: 
-   - Prohibido usar lenguaje inclusivo (escribe "amigos", JAMÁS "amig@s" ni "amigxs").
+1. IMPROVISACIONES (LA LEY DEL AUDIO): El audio manda. Si el SRT tiene palabras o frases que no están en el guion, es porque el orador improvisó. DEBES MANTENER la improvisación del SRT intacta. No fuerces el guion.
+2. CONJUGACIONES Y DIALECTO: SOLO si hay un claro error de regionalismo (ej. el SRT dice "querés", "tenés" pero el guion dice "querías", "tienes"), reemplázalo usando la palabra del guion.
+3. PROHIBICIONES ESTRICTAS (FORMATO): 
+   - Devuelve ÚNICAMENTE el código SRT puro.
+   - PROHIBIDO justificar tus cambios. NO uses flechas ("->", "→"). NO escribas la palabra "correcto", ni "reemplazo", ni "no hay error".
    - Prohibido repetir palabras entre el final de un subtítulo y el inicio de otro.
-   - Prohibido escribir charla (cero "aquí tienes", cero "(continúa)"). Devuelve ÚNICAMENTE el código SRT.
 
 GUION ORIGINAL DE REFERENCIA:
 {guion_referencia}
@@ -83,42 +83,40 @@ FRAGMENTO SRT A CORREGIR:
             result = json.loads(response.read().decode("utf-8"))
             texto_corregido = result.get("response", "").strip()
             
-            # ESCUDO DE SEGURIDAD
-            if texto_corregido.count('-->') != bloque_srt.count('-->'):
-                return bloque_srt 
+            # --- EL NUEVO ESCUDO DESTRUCTIVO DE PYTHON ---
+            # Escanea el texto y busca bloques válidos (ID + Tiempo + Texto)
+            pattern = r'(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\s*\n|\Z)'
+            matches = re.findall(pattern, texto_corregido, re.DOTALL)
             
-            # FILTRO DESTRUCTOR DE BASURA
-            match = re.search(r'\d+\s*\n\d{2}:\d{2}:\d{2},\d{3}\s*-->', texto_corregido)
-            if match:
-                texto_corregido = texto_corregido[match.start():]
-            
-            lineas = texto_corregido.split('\n')
-            lineas_limpias = []
-            
-            frases_prohibidas = ["corregí", "continúa", "a continuación", "aquí tienes", "este es el", "srt corregido", "¡"]
-            
-            for linea in lineas:
-                l = linea.strip()
-                if not l:
-                    lineas_limpias.append("")
-                    continue
+            if not matches:
+                return bloque_srt # Si Llama alucinó un párrafo completo, ignoramos y devolvemos original
                 
-                if re.match(r'^\d+$', l) or '-->' in l:
-                    lineas_limpias.append(l)
-                else:
-                    texto = l.lower() 
-                    
-                    if any(frase in texto for frase in frases_prohibidas):
-                        continue
-                        
-                    # ELIMINAR SIGNOS Y ARREGLAR ARROBAS
-                    texto = texto.replace("@", "o") 
-                    for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
-                        texto = texto.replace(char, "")
-                    
-                    lineas_limpias.append(texto.strip())
+            bloques_limpios = []
             
-            return '\n'.join(lineas_limpias).strip()
+            for match in matches:
+                idx = match[0].strip()
+                timestamp = match[1].strip()
+                texto_crudo = match[2].strip()
+                
+                # Tomamos solo la primera línea del texto (por si Llama metió notas abajo del subtítulo)
+                texto = texto_crudo.split('\n')[0].lower()
+                
+                # --- LA GUILLOTINA ---
+                # Corta todo lo que esté después de una flecha o palabras prohibidas
+                texto = texto.split('->')[0].split('→')[0].strip()
+                texto = re.sub(r'(?i)\bcorrecto\b.*$', '', texto).strip()
+                texto = re.sub(r'(?i)\bno hay error\b.*$', '', texto).strip()
+                texto = re.sub(r'(?i)\breemplazo\b.*$', '', texto).strip()
+                texto = re.sub(r'(?i)\bsegún la ley\b.*$', '', texto).strip()
+                
+                # Limpieza de signos y arrobas
+                texto = texto.replace("@", "o") 
+                for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
+                    texto = texto.replace(char, "")
+                
+                bloques_limpios.append(f"{idx}\n{timestamp}\n{texto.strip()}")
+            
+            return '\n\n'.join(bloques_limpios)
             
     except Exception as e:
         print(f"[ERROR OLLAMA]: {str(e)}")
@@ -140,7 +138,6 @@ class TranscriptorProApp(ctk.CTk):
         self.total_segmentos = 0
         self.ultimo_srt_generado = None
         
-        # --- NUEVO: Variable para controlar la altura de la caja del guion ---
         self.altura_guion_actual = 120 
 
         self.crear_interfaz()
@@ -200,23 +197,19 @@ class TranscriptorProApp(ctk.CTk):
         
         ctk.CTkLabel(script_header, text="MOTOR", font=("Helvetica", 10, "bold"), text_color="#555555").pack(side="right", padx=5)
 
-        # --- SE APLICA LA ALTURA VARIABLE AQUÍ ---
         self.txt_guion = ctk.CTkTextbox(script_frame, height=self.altura_guion_actual, fg_color="#151515", border_width=0, text_color="#B0B0B0", font=("Helvetica", 13))
         self.txt_guion.pack(fill="x", padx=15, pady=(15, 0))
 
-        # --- LA NUEVA PESTAÑITA (RESIZER) ---
         self.resizer_frame = ctk.CTkFrame(script_frame, height=10, fg_color="#36225B", cursor="sb_v_double_arrow", corner_radius=3)
         self.resizer_frame.pack(fill="x", padx=15, pady=(2, 10))
         
         lbl_dots = ctk.CTkLabel(self.resizer_frame, text="•••", font=("Arial", 9, "bold"), text_color="#A0A0A0", height=10)
         lbl_dots.place(relx=0.5, rely=0.5, anchor="center")
 
-        # Eventos para arrastrar y cambiar tamaño
         self.resizer_frame.bind("<ButtonPress-1>", self.iniciar_redimension)
         self.resizer_frame.bind("<B1-Motion>", self.redimensionar_guion)
         lbl_dots.bind("<ButtonPress-1>", self.iniciar_redimension)
         lbl_dots.bind("<B1-Motion>", self.redimensionar_guion)
-        # ------------------------------------
 
         self.lbl_titulo_timeline = ctk.CTkLabel(self, text="Línea de tiempo", font=("Helvetica", 12, "bold"), text_color="#777777")
         self.lbl_titulo_timeline.pack(anchor="w", padx=20, pady=(10, 0))
@@ -233,7 +226,6 @@ class TranscriptorProApp(ctk.CTk):
         self.txt_timeline._textbox.tag_config("llama_msg", foreground="#9B59B6", font=("Helvetica", 12, "italic")) 
         self.txt_timeline.configure(state="disabled")
 
-    # --- LÓGICA DE LA PESTAÑITA REDIMENSIONABLE ---
     def iniciar_redimension(self, event):
         self._start_y = event.y_root
 
@@ -246,7 +238,6 @@ class TranscriptorProApp(ctk.CTk):
             
         self.txt_guion.configure(height=self.altura_guion_actual)
         self._start_y = event.y_root
-    # ----------------------------------------------
 
     def verificar_estado_ollama(self):
         threading.Thread(target=self._hilo_ping_ollama, daemon=True).start()
