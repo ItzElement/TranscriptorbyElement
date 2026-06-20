@@ -27,6 +27,7 @@ import subprocess
 import json
 import urllib.request
 import gc
+import re
 from faster_whisper import WhisperModel
 
 # --- Funciones de Formato ---
@@ -44,31 +45,26 @@ def format_ui_time(seconds: float):
     secs = math.floor(seconds % 60)
     return f"{minutes}:{secs:02d}"
 
-def capitalizar_primera_letra(texto):
-    texto = texto.strip().lower()
-    for i, char in enumerate(texto):
-        if char.isalpha(): 
-            return texto[:i] + char.upper() + texto[i+1:]
-    return texto
-
-# --- CONEXIÓN A OLLAMA ---
+# --- CONEXIÓN A OLLAMA (Cerebro Definitivo) ---
 def corregir_bloque_srt_con_llama(bloque_srt, guion_referencia):
     url = "http://127.0.0.1:11434/api/generate"
     
-    prompt = f"""Eres un experto en edición de subtítulos. 
-Tu tarea es comparar el FRAGMENTO SRT generado por una IA de audio con el GUION ORIGINAL, y corregir las palabras mal interpretadas (ej. cambios de acento como "querés" en vez de "querías", palabras que suenan parecido, o errores de dictado). 
-Las palabras del SRT deben coincidir EXACTAMENTE con las del guion original.
+    # JERARQUÍA DE REGLAS PARA EVITAR CONFLICTOS LÓGICOS
+    prompt = f"""Eres un editor ortográfico estricto de subtítulos.
+
+JERARQUÍA DE REGLAS (Síguelas en este orden exacto):
+1. CONJUGACIONES Y DIALECTO (LA LEY DEL GUION): Compara las palabras del SRT con las del guion. Si el SRT tiene una variación regional, error de dictado o conjugación distinta (ejemplo: dice "querés", "quieres", "hablastes"), pero el guion dice "querías" o "hablaste", OBLIGATORIAMENTE debes reemplazar la palabra del SRT por la palabra exacta del guion original.
+2. IMPROVISACIONES (LA LEY DEL AUDIO): Solo si el SRT contiene palabras EXTRA o frases completamente distintas que NO están en el guion, asume que es una improvisación y MANTÉNLAS. 
+3. PROHIBICIONES ESTRICTAS: 
+   - Prohibido usar lenguaje inclusivo (escribe "amigos", JAMÁS "amig@s" ni "amigxs").
+   - Prohibido repetir palabras entre el final de un subtítulo y el inicio de otro.
+   - Prohibido escribir charla (cero "aquí tienes", cero "(continúa)"). Devuelve ÚNICAMENTE el código SRT.
 
 GUION ORIGINAL DE REFERENCIA:
 {guion_referencia}
 
 FRAGMENTO SRT A CORREGIR:
 {bloque_srt}
-
-REGLAS ESTRICTAS:
-1. Devuelve ÚNICAMENTE el código SRT corregido. Cero introducciones.
-2. RESPETA LOS TIEMPOS (timestamps) y los números de los subtítulos intactos.
-3. Si el audio dice una palabra con otro acento o errónea, pero en el guion original está la correcta, REEMPLÁZALA por la del guion.
 """
 
     payload = {
@@ -76,7 +72,7 @@ REGLAS ESTRICTAS:
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.0  # Para que sea 100% estricto y no invente
+            "temperature": 0.0 # 0 creatividad, 100% obediencia
         }
     }
     
@@ -87,13 +83,43 @@ REGLAS ESTRICTAS:
             result = json.loads(response.read().decode("utf-8"))
             texto_corregido = result.get("response", "").strip()
             
-            if texto_corregido.startswith("```"):
-                texto_corregido = texto_corregido.split("```")[1]
-                if texto_corregido.startswith("srt"):
-                    texto_corregido = texto_corregido[3:].strip()
-            texto_corregido = texto_corregido.replace("```", "").strip()
+            # ESCUDO DE SEGURIDAD
+            if texto_corregido.count('-->') != bloque_srt.count('-->'):
+                return bloque_srt 
             
-            return texto_corregido
+            # FILTRO DESTRUCTOR DE BASURA
+            match = re.search(r'\d+\s*\n\d{2}:\d{2}:\d{2},\d{3}\s*-->', texto_corregido)
+            if match:
+                texto_corregido = texto_corregido[match.start():]
+            
+            lineas = texto_corregido.split('\n')
+            lineas_limpias = []
+            
+            frases_prohibidas = ["corregí", "continúa", "a continuación", "aquí tienes", "este es el", "srt corregido", "¡"]
+            
+            for linea in lineas:
+                l = linea.strip()
+                if not l:
+                    lineas_limpias.append("")
+                    continue
+                
+                if re.match(r'^\d+$', l) or '-->' in l:
+                    lineas_limpias.append(l)
+                else:
+                    texto = l.lower() 
+                    
+                    if any(frase in texto for frase in frases_prohibidas):
+                        continue
+                        
+                    # ELIMINAR SIGNOS Y ARREGLAR ARROBAS
+                    texto = texto.replace("@", "o") 
+                    for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
+                        texto = texto.replace(char, "")
+                    
+                    lineas_limpias.append(texto.strip())
+            
+            return '\n'.join(lineas_limpias).strip()
+            
     except Exception as e:
         print(f"[ERROR OLLAMA]: {str(e)}")
         return bloque_srt
@@ -115,8 +141,6 @@ class TranscriptorProApp(ctk.CTk):
         self.ultimo_srt_generado = None
 
         self.crear_interfaz()
-        
-        # Iniciar el radar de Ollama
         self.verificar_estado_ollama()
 
     def crear_interfaz(self):
@@ -168,7 +192,6 @@ class TranscriptorProApp(ctk.CTk):
         self.combo_motor.set("Whisper (Crudo)")
         self.combo_motor.pack(side="right", padx=10)
         
-        # --- EL NUEVO SEMÁFORO DE OLLAMA ---
         self.lbl_ollama_status = ctk.CTkLabel(script_header, text="⚪ Verificando...", font=("Helvetica", 11, "bold"), text_color="#888888")
         self.lbl_ollama_status.pack(side="right", padx=10)
         
@@ -192,33 +215,23 @@ class TranscriptorProApp(ctk.CTk):
         self.txt_timeline._textbox.tag_config("llama_msg", foreground="#9B59B6", font=("Helvetica", 12, "italic")) 
         self.txt_timeline.configure(state="disabled")
 
-    # --- MAGIA DEL RADAR EN SEGUNDO PLANO ---
     def verificar_estado_ollama(self):
-        # Corre en un hilo para no congelar la UI si el internet/local está lento
         threading.Thread(target=self._hilo_ping_ollama, daemon=True).start()
-        # Vuelve a checar automáticamente cada 4 segundos
         self.after(4000, self.verificar_estado_ollama)
 
     def _hilo_ping_ollama(self):
         try:
             url = "http://127.0.0.1:11434/api/tags"
             req = urllib.request.Request(url)
-            # Timeout de 2 segundos para que responda rápido
             with urllib.request.urlopen(req, timeout=2) as response:
                 data = json.loads(response.read().decode("utf-8"))
                 modelos = [m["name"] for m in data.get("models", [])]
-                
-                # Busca si tiene algún modelo que empiece con "llama3"
-                tiene_llama = any(m.startswith("llama3") for m in modelos)
-                
-                if tiene_llama:
+                if any(m.startswith("llama3") for m in modelos):
                     self.after(0, lambda: self.lbl_ollama_status.configure(text="🟢 Llama ON", text_color="#2ECC71"))
                 else:
                     self.after(0, lambda: self.lbl_ollama_status.configure(text="🟠 Falta Modelo", text_color="#F39C12"))
-                    
         except Exception:
             self.after(0, lambda: self.lbl_ollama_status.configure(text="🔴 Ollama OFF", text_color="#E74C3C"))
-    # ----------------------------------------
 
     def editar_srt(self):
         if self.ultimo_srt_generado and os.path.exists(self.ultimo_srt_generado):
@@ -229,8 +242,6 @@ class TranscriptorProApp(ctk.CTk):
                     subprocess.call(('open', self.ultimo_srt_generado))
             except Exception as e:
                 self.log_system(f"⚠️ Error al abrir el archivo: {str(e)}")
-        else:
-            self.log_system("⚠️ Aún no has generado ningún SRT para editar.")
 
     def seleccionar_archivo(self):
         filepath = filedialog.askopenfilename(title="Selecciona el archivo", filetypes=[("Audio/Video", "*.mp4 *.mp3 *.wav *.mkv *.mov *.m4a")])
@@ -276,6 +287,16 @@ class TranscriptorProApp(ctk.CTk):
         self.total_segmentos += 1
         self.lbl_segmentos.configure(text=f"SEGMENTOS {self.total_segmentos}", text_color="#E0E0E0")
         self.lbl_titulo_timeline.configure(text=f"Línea de tiempo (Transcribiendo...)")
+
+    def _forzar_limpieza_vram_ollama(self):
+        self.log_system("🧹 Vaciando VRAM de Llama 3...", "sys_msg")
+        url = "http://127.0.0.1:11434/api/generate"
+        payload = {"model": "llama3", "keep_alive": 0} 
+        try:
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req)
+        except Exception:
+            pass
 
     def iniciar_transcripcion(self):
         if not self.archivo_entrada:
@@ -342,9 +363,9 @@ class TranscriptorProApp(ctk.CTk):
                         chunk_end = word_obj.end
                         texto_final = " ".join(current_chunk_words)
                         
-                        for char in [',', '.', ';', ':', '!', '…', '¡']:
+                        for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
                             texto_final = texto_final.replace(char, "")
-                        texto_final = capitalizar_primera_letra(texto_final)
+                        texto_final = texto_final.lower()
                         
                         lista_srt_crudo.append({"index": sub_index, "start": format_timestamp(chunk_start), "end": format_timestamp(chunk_end), "text": texto_final})
                         
@@ -358,9 +379,9 @@ class TranscriptorProApp(ctk.CTk):
                 if current_chunk_words:
                     chunk_end = segment.end
                     texto_final = " ".join(current_chunk_words)
-                    for char in [',', '.', ';', ':', '!', '…', '¡']:
+                    for char in [',', '.', ';', ':', '!', '¡', '?', '¿', '…', '"', "'", '(', ')']:
                         texto_final = texto_final.replace(char, "")
-                    texto_final = capitalizar_primera_letra(texto_final)
+                    texto_final = texto_final.lower()
                         
                     lista_srt_crudo.append({"index": sub_index, "start": format_timestamp(chunk_start), "end": format_timestamp(chunk_end), "text": texto_final})
                     self.log_segment(chunk_start, chunk_end, texto_final)
@@ -374,16 +395,15 @@ class TranscriptorProApp(ctk.CTk):
             with open(salida, "w", encoding="utf-8") as f:
                 f.write(srt_final_text)
 
-            # FASE 2: LIBERAR GPU
+            # FASE 2: LIBERAR GPU DE WHISPER
+            self.log_system("\nLiberando memoria gráfica de Whisper...", "sys_msg")
+            del self.modelo_cargado
+            self.modelo_cargado = None
+            gc.collect() 
+                
+            # FASE 3: CORRECCIÓN EN LOTES (LLAMA)
             usar_llama = (motor == "Llama 3 Local" and len(guion) > 10)
             
-            if usar_llama:
-                self.log_system("\nTranscripción base completada. Liberando memoria gráfica...", "sys_msg")
-                del self.modelo_cargado
-                self.modelo_cargado = None
-                gc.collect() 
-                
-            # FASE 3: CORRECCIÓN EN LOTES
             if usar_llama:
                 self.log_system("🧠 Iniciando Llama 3. Corrigiendo subtítulos por lotes...", "llama_msg")
                 
@@ -403,13 +423,17 @@ class TranscriptorProApp(ctk.CTk):
                     bloque_corregido = corregir_bloque_srt_con_llama(bloque_str, guion)
                     texto_srt_corregido += bloque_corregido + "\n\n"
                 
+                # LIMPIEZA DE ESPACIOS DOBLES EN BLANCO
+                texto_srt_corregido = re.sub(r'\n{3,}', '\n\n', texto_srt_corregido)
+                
                 with open(salida, "w", encoding="utf-8") as f:
-                    f.write(texto_srt_corregido)
+                    f.write(texto_srt_corregido.strip() + "\n")
                     
                 self.log_system("✨ Llama 3 ha finalizado la corrección del archivo SRT.", "llama_msg")
+                self._forzar_limpieza_vram_ollama()
                 
             elif motor == "Llama 3 Local":
-                self.log_system("⚠️ Elegiste Llama 3 pero no pegaste el guion. El archivo SRT se guardó sin corregir.", "sys_msg")
+                self.log_system("⚠️ Elegiste Llama 3 pero no pegaste el guion. El archivo SRT se guardó en crudo.", "sys_msg")
 
             self.log_system(f"✅ ¡PROCESO COMPLETADO EXITOSAMENTE!")
             
