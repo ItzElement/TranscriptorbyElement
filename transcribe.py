@@ -129,7 +129,6 @@ SALIDA:
                             similitud = SequenceMatcher(None, texto_viejo.lower(), texto_nuevo.lower()).ratio()
                             
                             # MAGIA: Escudo Anti-Duplicados
-                            # Si Llama intenta usar un texto que YA usamos, y no era así originalmente, lo bloqueamos
                             if texto_nuevo.lower() in textos_nuevos_aceptados and texto_viejo.lower() not in textos_nuevos_aceptados:
                                 print(f"[*] Escudo Anti-Duplicados en ID {sub['index']}: Llama repitió una línea. Se mantuvo original.")
                                 textos_nuevos_aceptados.add(texto_viejo.lower())
@@ -359,20 +358,26 @@ class TranscriptorProApp(ctk.CTk):
     def procesar_whisper_y_llama(self, entrada, salida, motor, guion):
         try:
             if not self.modelo_cargado:
-                self.log_system("Iniciando motor Whisper V3 (GPU). Por favor espera...")
+                self.log_system("Iniciando motor Whisper V3 (Ultra-GPU). Por favor espera...")
                 self.modelo_cargado = WhisperModel("large-v3", device="cuda", compute_type="float16")
             
-            self.log_system("Analizando audio y calculando pausas...")
+            self.log_system("Analizando audio (Maximizando recursos GPU)...")
             
+            # --- MODO ULTRA GPU ACTIVADO ---
             segments, info = self.modelo_cargado.transcribe(
-                entrada, beam_size=5, language="es",
-                vad_filter=True, vad_parameters=dict(min_silence_duration_ms=250),
-                word_timestamps=True
+                entrada, 
+                beam_size=12,          # Maximizando búsqueda
+                best_of=12,            # 12 intentos simultáneos
+                language="es",
+                vad_filter=True, 
+                vad_parameters=dict(min_silence_duration_ms=250),
+                word_timestamps=True,
+                condition_on_previous_text=False # ESTO EVITA ALUCINACIONES Y SALTOS DE TIEMPO
             )
 
             self.after(0, self.actualizar_metricas, info.language, info.duration)
 
-            MAX_PALABRAS = 12 
+            MAX_PALABRAS = 12
             MIN_PALABRAS = 1
             sub_index = 1
             lista_srt_crudo = []
@@ -445,7 +450,7 @@ class TranscriptorProApp(ctk.CTk):
             
             if usar_llama:
                 self.log_system("🧠 Iniciando Llama 3. Corrigiendo subtítulos por lotes...", "llama_msg")
-                tamano_lote = 8 # Lotes chiquitos para que no se maree Llama
+                tamano_lote = 15
                 total_lotes = math.ceil(len(lista_srt_crudo) / tamano_lote)
                 
                 for i in range(0, len(lista_srt_crudo), tamano_lote):
